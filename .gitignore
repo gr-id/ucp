@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+keys/
+*.pem
+logs/
+.streamlit/
+.uv-cache/
+.pytest_cache/
+.idea/
+.vscode/
+*.log
+.claude/settings.local.json
