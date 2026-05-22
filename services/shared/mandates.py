@@ -1,10 +1,13 @@
-"""Pydantic models for AP2 Mandates (simplified JWS-only demo variant).
+"""Pydantic models for AP2 Mandates (2nd PoC — stub-signature variant).
 
-Spec correspondence:
-  IntentMandate     — AP2 Intent Mandate (signed by user)
-  MerchantAuthorization — UCP `ap2.merchant_authorization` (signed by merchant)
-  CheckoutMandate   — UCP `ap2.checkout_mandate` (signed by user, embeds checkout)
-  PaymentMandate    — AP2 Payment Mandate (signed by user, sent to PSP)
+Schema evolution from 1st PoC:
+  - `IntentMandate` now uses structured fields (item_query, price_range,
+    allowed_merchants, expires_at, auto_purchase) instead of free-text natural
+    language + ad-hoc Constraints.
+  - All Mandate types carry a `StubSignature` instead of being wrapped in a JWS
+    string. The 1st PoC proved real ES256 JWS; this PoC focuses on data + UX.
+  - `LineItem` gains `image_url`, `source_merchant`, `product_url` so the UI can
+    show real product visuals when the catalog is backed by SerpAPI.
 """
 
 from __future__ import annotations
@@ -24,20 +27,47 @@ def _jti() -> str:
     return f"mnd_{uuid.uuid4().hex[:16]}"
 
 
-class Constraints(BaseModel):
-    max_price_cents: int | None = None
-    currency: str = "USD"
-    keywords: list[str] = Field(default_factory=list)
+# ---------- shared ----------
+
+
+class StubSignature(BaseModel):
+    """Placeholder for a real signature.
+
+    The 2nd PoC assumes the signer (user or merchant) holds signing capability
+    on an external device. We carry the signer identity, timestamp, and a short
+    payload hash so the Protocol Inspector can show "what would have been
+    signed" without performing actual cryptographic verification.
+    """
+
+    signer: Literal["user", "merchant", "psp"]
+    signed_at: int
+    payload_hash: str
+    note: str = "stub — 2nd PoC: real signing handled by external device"
+
+
+class PriceRange(BaseModel):
+    from_cents: int
+    to_cents: int
+
+
+# ---------- mandates ----------
 
 
 class IntentMandate(BaseModel):
-    """Captured before the agent does anything. Bounds what the agent may buy."""
+    """Captured from the user's structured intent form.
+
+    Bounds what the agent may buy: which merchants, what price band, until when,
+    and whether automatic purchasing is permitted (PoC always treats as manual).
+    """
 
     jti: str = Field(default_factory=_jti)
     iat: int = Field(default_factory=_now)
-    natural_language: str
-    constraints: Constraints
+    item_query: str
+    price_range: PriceRange
+    allowed_merchants: list[str]
     expires_at: int
+    auto_purchase: bool = False
+    signature: StubSignature
 
 
 class LineItem(BaseModel):
@@ -45,6 +75,9 @@ class LineItem(BaseModel):
     title: str
     qty: int
     unit_price_cents: int
+    image_url: str | None = None
+    source_merchant: str | None = None
+    product_url: str | None = None
 
     @property
     def line_total_cents(self) -> int:
@@ -52,7 +85,7 @@ class LineItem(BaseModel):
 
 
 class CheckoutBody(BaseModel):
-    """The UCP checkout object the merchant returns. Signed by the merchant."""
+    """The cart the merchant has assembled and is willing to honor."""
 
     id: str
     status: Literal["ready_for_complete", "completed", "cancelled"]
@@ -67,38 +100,16 @@ class CheckoutBody(BaseModel):
 
 
 class MerchantAuthorization(BaseModel):
-    """Signed by merchant; binds the checkout body via content_hash."""
+    """Merchant's commitment to a specific checkout body."""
 
     jti: str = Field(default_factory=_jti)
     iat: int = Field(default_factory=_now)
     checkout_id: str
-    checkout_hash: str  # base64url(sha256(JCS(CheckoutBody)))
+    checkout_body: dict[str, Any]
+    signature: StubSignature
 
 
-class CheckoutMandate(BaseModel):
-    """Signed by user; commits user to a specific checkout. Embeds the prior chain."""
-
-    jti: str = Field(default_factory=_jti)
-    iat: int = Field(default_factory=_now)
-    intent_mandate_jws: str  # signed Intent Mandate
-    checkout_body: dict[str, Any]  # the exact body the merchant signed
-    merchant_authorization_jws: str  # merchant's signature over checkout body
-    user_decision: Literal["approved", "declined"] = "approved"
-
-
-class PaymentMethod(BaseModel):
-    type: Literal["card_token"] = "card_token"
-    token: str = "tok_demo_visa_4242"
-    last4: str = "4242"
-
-
-class PaymentMandate(BaseModel):
-    """Signed by user; sent to PSP along with the prior chain to authorize charge."""
-
-    jti: str = Field(default_factory=_jti)
-    iat: int = Field(default_factory=_now)
-    checkout_mandate_jws: str
-    amount_cents: int
-    currency: str = "USD"
-    merchant_id: str
-    payment_method: PaymentMethod = Field(default_factory=PaymentMethod)
+# ---------- retained but unused in 2nd PoC ----------
+# CheckoutMandate / PaymentMandate would be reached only after the user's
+# Approve action, which is disabled in this PoC. We omit them rather than ship
+# half-defined types; the 1st PoC's commit history preserves the full chain.

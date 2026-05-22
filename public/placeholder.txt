@@ -1,0 +1,2 @@
+All requests are rewritten to the Cloud Run service `ucp-poc` in `asia-northeast3`.
+This file exists only to satisfy the Firebase Hosting "public" folder requirement.

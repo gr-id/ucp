@@ -66,6 +66,12 @@ def stop_all() -> None:
 def main() -> None:
     # Clean event log so the UI starts fresh.
     sys.path.insert(0, str(ROOT))
+    # Load .env (if present) so spawned subprocesses inherit SERPAPI_KEY etc.
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(ROOT / ".env")
+    except ImportError:
+        pass
     from services.shared.eventlog import reset
 
     reset()
@@ -75,14 +81,11 @@ def main() -> None:
         [py, "-m", "uvicorn", "services.merchant.main:app", "--port", "8001", "--log-level", "warning"],
         "merchant",
     )
-    spawn(
-        [py, "-m", "uvicorn", "services.psp.main:app", "--port", "8002", "--log-level", "warning"],
-        "psp",
-    )
+    # PSP is not part of the 2nd PoC (stops at cart review). It can be started
+    # manually for 1st-PoC regression tests, but we omit it from the demo launcher.
     try:
         wait_for("http://127.0.0.1:8001/healthz")
-        wait_for("http://127.0.0.1:8002/healthz")
-        print("  merchant + PSP ready.")
+        print("  merchant ready (catalog mode = " + os.environ.get("UCP_CATALOG_MODE", "mock") + ").")
     except Exception as e:
         print(f"FAILED: {e}")
         stop_all()

@@ -1,32 +1,54 @@
-"""UCP-compatible merchant service (demo).
+"""UCP-compatible merchant service (2nd PoC).
+
+Differences from the 1st PoC merchant:
+  - No JWS verification — Mandates carry `StubSignature` placeholders. The
+    underlying *data* of the Intent is still enforced (price band, allowed
+    merchants, expiry); only the cryptographic ceremony is abstracted.
+  - `/ucp/search` request body carries the structured intent fields directly.
+  - `/ucp/checkout` accepts the full IntentMandate (as JSON) and verifies the
+    cart against it.
+  - The endpoint chain stops at checkout — the 2nd PoC never reaches
+    `/ucp/checkout/{id}/complete`. We keep the route registered so the 1st-PoC
+    smoke test can still hit it during regression, but it now operates on the
+    new schema.
 
 Endpoints:
-  GET  /ucp/search                       — discover products
-  POST /ucp/checkout                     — open a checkout session (returns ap2.merchant_authorization)
-  POST /ucp/checkout/{id}/complete       — submit ap2.checkout_mandate to finalize
-  GET  /ucp/_inspect/state               — debug view of in-memory checkouts
+  GET  /healthz
+  POST /ucp/search                          — discover products
+  POST /ucp/checkout                        — open a checkout session
+  GET  /ucp/_inspect/state                  — debug view of in-memory checkouts
 """
 
 from __future__ import annotations
 
+import time
 import uuid
+from pathlib import Path
 from typing import Any, Literal
+
+# Load .env at import time so direct `uvicorn services.merchant.main:app`
+# launches pick up SERPAPI_KEY / UCP_CATALOG_MODE without manual export.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
+except ImportError:
+    pass
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from services.merchant import catalog
-from services.shared.crypto import content_hash, sign, verify
 from services.shared.eventlog import log_event
 from services.shared.mandates import (
     CheckoutBody,
+    IntentMandate,
     LineItem,
     MerchantAuthorization,
 )
+from services.shared.stub_sig import stub_sign
 
-app = FastAPI(title="UCP Merchant (demo)")
+app = FastAPI(title="UCP Merchant (2nd PoC)")
 
-# In-memory store: checkout_id -> checkout state
 _CHECKOUTS: dict[str, dict[str, Any]] = {}
 
 TAX_RATE = 0.08
@@ -37,9 +59,12 @@ MERCHANT_ID = "demo-shop"
 
 
 class SearchRequest(BaseModel):
-    query: str | None = None
-    max_price_cents: int | None = None
-    color: str | None = None
+    item_query: str
+    price_from_cents: int = 0
+    price_to_cents: int = 10_000_00
+    allowed_merchants: list[str] = []
+    # Optional per-request SerpAPI key — overrides server env. Never logged.
+    serpapi_key: str | None = None
 
 
 class CartItemReq(BaseModel):
@@ -50,22 +75,13 @@ class CartItemReq(BaseModel):
 class CheckoutCreateRequest(BaseModel):
     items: list[CartItemReq]
     buyer_email: str
-    intent_mandate_jws: str  # signed by user — proves there's an authorizing intent
+    intent_mandate: IntentMandate  # carries StubSignature
 
 
 class CheckoutCreateResponse(BaseModel):
     checkout: dict
-    ap2: dict  # {"merchant_authorization": "<jws>"}
-
-
-class CheckoutCompleteRequest(BaseModel):
-    checkout_mandate_jws: str  # signed by user, embeds the merchant_authorization
-
-
-class CheckoutCompleteResponse(BaseModel):
-    checkout_id: str
-    status: Literal["completed"]
-    payment_mandate_jws_request: dict  # what the agent should send to the PSP
+    merchant_authorization: MerchantAuthorization
+    catalog_mode: str
 
 
 # ---------- endpoints ----------
@@ -73,51 +89,93 @@ class CheckoutCompleteResponse(BaseModel):
 
 @app.get("/healthz")
 def healthz() -> dict:
-    return {"ok": True, "service": "merchant", "merchant_id": MERCHANT_ID}
+    return {
+        "ok": True,
+        "service": "merchant",
+        "merchant_id": MERCHANT_ID,
+        "catalog_mode": catalog.get_mode(),
+    }
 
 
 @app.post("/ucp/search")
 def search(req: SearchRequest) -> dict:
-    results = catalog.search(req.query, req.max_price_cents, req.color)
+    results = catalog.search(
+        query=req.item_query,
+        from_cents=req.price_from_cents,
+        to_cents=req.price_to_cents,
+        allowed_merchants=req.allowed_merchants,
+        serpapi_key=req.serpapi_key,
+    )
+    # Summary of merchant distribution — useful in the Protocol Inspector.
+    by_merchant: dict[str, int] = {}
+    for r in results:
+        m = r.get("source_merchant") or "unknown"
+        by_merchant[m] = by_merchant.get(m, 0) + 1
+
+    # Log without the SerpAPI key — it's a per-user secret.
+    safe_query = req.model_dump(exclude={"serpapi_key"})
     log_event(
         "merchant",
         "ucp.search",
-        f"Searched: q={req.query!r} max={req.max_price_cents} color={req.color} → {len(results)} hits",
-        {"query": req.model_dump(), "result_count": len(results)},
+        f"Searched: {req.item_query!r} ${req.price_from_cents/100:.0f}–${req.price_to_cents/100:.0f} "
+        f"in {req.allowed_merchants or 'all'} → {len(results)} hits ({by_merchant})",
+        {
+            "query": safe_query,
+            "user_supplied_serpapi_key": bool(req.serpapi_key),
+            "result_count": len(results),
+            "by_merchant": by_merchant,
+            "catalog_mode": catalog.get_mode(),
+        },
     )
-    return {"results": results, "count": len(results)}
+    return {
+        "results": results,
+        "count": len(results),
+        "by_merchant": by_merchant,
+        "catalog_mode": catalog.get_mode(),
+    }
 
 
 @app.post("/ucp/checkout", response_model=CheckoutCreateResponse)
 def create_checkout(req: CheckoutCreateRequest) -> CheckoutCreateResponse:
-    # 1. Verify the user's Intent Mandate — merchant must see a valid intent before binding.
-    try:
-        intent = verify(req.intent_mandate_jws, expected_issuer="user")
-    except ValueError as e:
-        log_event("merchant", "ucp.checkout.reject", f"Invalid intent mandate: {e}")
-        raise HTTPException(400, f"invalid intent mandate: {e}")
+    intent = req.intent_mandate
 
-    # 2. Build line items + totals.
+    # 1. Intent must still be valid.
+    if intent.expires_at < int(time.time()):
+        log_event("merchant", "ucp.checkout.reject", f"Intent {intent.jti} expired")
+        raise HTTPException(400, "intent mandate expired")
+
+    # 2. Build line items + totals, and verify each item is from an allowed merchant.
     line_items: list[LineItem] = []
     for item in req.items:
         product = catalog.get(item.product_id)
         if product is None:
             raise HTTPException(404, f"unknown product: {item.product_id}")
+        if intent.allowed_merchants and product.get("source_merchant") not in intent.allowed_merchants:
+            log_event(
+                "merchant",
+                "ucp.checkout.reject",
+                f"product {item.product_id} source {product.get('source_merchant')!r} not in intent.allowed_merchants",
+            )
+            raise HTTPException(400, f"merchant {product.get('source_merchant')!r} not in intent.allowed_merchants")
         line_items.append(catalog.make_line_item(item.product_id, item.qty))
 
     subtotal = sum(li.line_total_cents for li in line_items)
     tax = round(subtotal * TAX_RATE)
     total = subtotal + tax
 
-    # 3. Enforce intent constraints.
-    max_price = (intent.get("constraints") or {}).get("max_price_cents")
-    if max_price is not None and total > max_price:
+    # 3. Enforce intent price range.
+    if total < intent.price_range.from_cents or total > intent.price_range.to_cents:
         log_event(
             "merchant",
             "ucp.checkout.reject",
-            f"Total {total} exceeds intent max_price {max_price}",
+            f"Total {total} outside intent price range "
+            f"[{intent.price_range.from_cents}, {intent.price_range.to_cents}]",
         )
-        raise HTTPException(400, f"total {total} exceeds intent max_price {max_price}")
+        raise HTTPException(
+            400,
+            f"total {total} outside intent price range "
+            f"[{intent.price_range.from_cents}, {intent.price_range.to_cents}]",
+        )
 
     checkout = CheckoutBody(
         id=f"chk_{uuid.uuid4().hex[:12]}",
@@ -129,20 +187,21 @@ def create_checkout(req: CheckoutCreateRequest) -> CheckoutCreateResponse:
         total_cents=total,
         merchant_id=MERCHANT_ID,
     )
-
-    # 4. Merchant signs the checkout body — binds it via content_hash.
     body_dict = checkout.model_dump()
-    auth = MerchantAuthorization(
+
+    # 4. Merchant "signs" the checkout body (stub).
+    merchant_auth = MerchantAuthorization(
         checkout_id=checkout.id,
-        checkout_hash=content_hash(body_dict),
+        checkout_body=body_dict,
+        signature=stub_sign("merchant", body_dict),
     )
-    auth_jws = sign("merchant", auth.model_dump())
 
     _CHECKOUTS[checkout.id] = {
         "body": body_dict,
-        "merchant_authorization_jws": auth_jws,
+        "merchant_authorization": merchant_auth.model_dump(),
         "status": "ready_for_complete",
-        "intent_mandate_jti": intent.get("jti"),
+        "intent_jti": intent.jti,
+        "intent_mandate": intent.model_dump(),
     }
 
     log_event(
@@ -152,69 +211,19 @@ def create_checkout(req: CheckoutCreateRequest) -> CheckoutCreateResponse:
         {
             "checkout_id": checkout.id,
             "total_cents": total,
-            "merchant_authorization_jws": auth_jws,
+            "merchant_authorization": merchant_auth.model_dump(),
             "checkout_body": body_dict,
+            "intent_jti": intent.jti,
         },
     )
 
     return CheckoutCreateResponse(
         checkout=body_dict,
-        ap2={"merchant_authorization": auth_jws},
-    )
-
-
-@app.post("/ucp/checkout/{checkout_id}/complete", response_model=CheckoutCompleteResponse)
-def complete_checkout(checkout_id: str, req: CheckoutCompleteRequest) -> CheckoutCompleteResponse:
-    state = _CHECKOUTS.get(checkout_id)
-    if state is None:
-        raise HTTPException(404, "unknown checkout")
-    if state["status"] != "ready_for_complete":
-        raise HTTPException(409, f"checkout state is {state['status']}")
-
-    # Verify user's Checkout Mandate.
-    try:
-        cm = verify(req.checkout_mandate_jws, expected_issuer="user")
-    except ValueError as e:
-        log_event("merchant", "ucp.complete.reject", f"Invalid checkout mandate: {e}")
-        raise HTTPException(400, f"invalid checkout mandate: {e}")
-
-    # Cross-check: the user-signed checkout body must match what we signed.
-    user_body = cm.get("checkout_body")
-    if content_hash(user_body) != content_hash(state["body"]):
-        log_event("merchant", "ucp.complete.reject", "Checkout body hash mismatch")
-        raise HTTPException(400, "checkout body hash mismatch")
-    if cm.get("merchant_authorization_jws") != state["merchant_authorization_jws"]:
-        log_event("merchant", "ucp.complete.reject", "merchant_authorization mismatch")
-        raise HTTPException(400, "merchant_authorization mismatch")
-    if cm.get("user_decision") != "approved":
-        raise HTTPException(400, "user did not approve")
-
-    # Verify the embedded Intent Mandate too — full chain check.
-    try:
-        verify(cm["intent_mandate_jws"], expected_issuer="user")
-    except ValueError as e:
-        raise HTTPException(400, f"invalid embedded intent mandate: {e}")
-
-    state["status"] = "completed"
-    log_event(
-        "merchant",
-        "ucp.complete.ok",
-        f"Checkout {checkout_id} completed; agent should now call PSP",
-        {"checkout_id": checkout_id, "total_cents": state["body"]["total_cents"]},
-    )
-
-    return CheckoutCompleteResponse(
-        checkout_id=checkout_id,
-        status="completed",
-        payment_mandate_jws_request={
-            "amount_cents": state["body"]["total_cents"],
-            "currency": state["body"]["currency"],
-            "merchant_id": state["body"]["merchant_id"],
-            "checkout_mandate_jws": req.checkout_mandate_jws,
-        },
+        merchant_authorization=merchant_auth,
+        catalog_mode=catalog.get_mode(),
     )
 
 
 @app.get("/ucp/_inspect/state")
 def inspect_state() -> dict:
-    return {"checkouts": _CHECKOUTS}
+    return {"checkouts": _CHECKOUTS, "catalog_mode": catalog.get_mode()}

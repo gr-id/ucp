@@ -1,50 +1,67 @@
 # UCP + AP2 agentic commerce demo
 
-A presentation-grade demo of an AI shopping agent buying on a user's behalf,
-using Google's **Universal Commerce Protocol (UCP)** to interact with the merchant
-and **Agent Payments Protocol (AP2)** to authorize the payment.
+Two PoCs in one repo, exploring Google's **Universal Commerce Protocol (UCP)**
+and **Agent Payments Protocol (AP2)**:
 
-The whole purchase chain is cryptographically signed and verified end-to-end:
+- **1st PoC** — full 4-mandate signing chain (Intent → MerchantAuth →
+  Checkout → Payment), ES256 JWS, in-memory mock catalog, ends with PSP
+  approval. *Goal: prove the protocol mechanics work end-to-end.*
+  → see git history (`git log --until 2026-05-21`) and `services/shared/crypto.py`.
+
+- **2nd PoC** (current `main`) — structured shopping-intent form,
+  **live UCP merchant products** (Walmart / Target / Wayfair / Etsy via SerpAPI),
+  stops at the **cart-review screen before payment**. Stub signatures (assume
+  user has signing capability on an external device).
+  → see [`docs/2nd-poc.md`](docs/2nd-poc.md).
+
+This README documents the **2nd PoC** (current state). For the original full
+crypto chain, check the commit history.
 
 ```
-  User                     Agent                  Merchant (UCP)         PSP
-   |                         |                         |                  |
-   | "buy white runners      |                         |                  |
-   |  under $150"            |                         |                  |
-   |───── prompt ────────────▶|                        |                  |
-   |        sign IntentMandate (ES256)                 |                  |
-   |                         |── /ucp/search ─────────▶|                  |
-   |                         |◀────── products ────────|                  |
-   |                         |── /ucp/checkout ───────▶|                  |
-   |                         |     +intent_mandate     |                  |
-   |                         |◀── checkout +           |                  |
-   |                         |     merchant_authz JWS  |                  |
-   |◀── cart for approval ───|                         |                  |
-   |── ✅ approve ────────────▶|                        |                  |
-   |        sign CheckoutMandate (embeds merchant_authz + intent)         |
-   |                         |── /ucp/checkout/.../complete ─▶            |
-   |                         |◀───── completed ────────|                  |
-   |        sign PaymentMandate (embeds CheckoutMandate)                  |
-   |                         |───────────── /psp/charge ─────────────────▶|
-   |                         |               PSP verifies full chain ✅   |
-   |                         |◀──────── txn authorized ───────────────────|
+[ Structured form ]                              [ Live UCP merchants ]
+  ┌───────────────┐         ┌───────────┐         ┌─────────────────┐
+  │ 구매할 물품    │         │           │         │ Walmart  Target │
+  │ 가격 범위     │ Submit  │  Merchant │ search  │ Wayfair  Etsy   │
+  │ 사이트 ☑☑☑☐  │ ──────▶ │   :8001   │ ──────▶ │ (via SerpAPI    │
+  │ 유지 시간     │         │           │         │  Google Shopping)│
+  │ 자동 구매 No  │         └───────────┘         └─────────────────┘
+  └───────────────┘                                       │
+                                                          ▼
+                                              [ 1 product selected, ]
+                                              [ stub-signed cart   ]
+                                                          │
+                                                          ▼
+                                              [ Approve disabled — ]
+                                              [ "결제 단계 비활성화" ]
 ```
 
-## What's inside
+## What's inside (2nd PoC)
 
 | Path | Role |
 | --- | --- |
-| `services/merchant/` | FastAPI UCP merchant on `:8001` — search, checkout, complete. Signs `merchant_authorization`, enforces intent constraints. |
-| `services/psp/` | FastAPI Payment Service Provider on `:8002` — verifies the full Mandate chain and authorizes the charge. |
-| `services/shared/crypto.py` | ES256 JWS sign/verify + RFC 8785 JSON Canonicalization (JCS). |
-| `services/shared/mandates.py` | Pydantic models for Intent / Merchant Authorization / Checkout / Payment Mandates. |
-| `services/shared/eventlog.py` | Append-only event log all services share — drives the Protocol Inspector. |
-| `agent/mock_agent.py` | Deterministic agent that drives the flow without an LLM. |
-| `agent/sdk_agent.py` | Claude Agent SDK variant — Claude picks the product via MCP tools. |
-| `ui/app.py` | Streamlit two-pane demo: chat (left) + protocol inspector with JWS decode (right). |
-| `scripts/gen_keys.py` | Generate ES256 keypairs for user / merchant / PSP. |
-| `scripts/run_demo.py` | One command that starts merchant + PSP + Streamlit. |
-| `scripts/smoke_*.py` | Quick checks: crypto round-trip, end-to-end purchase. |
+| `services/merchant/main.py` | FastAPI UCP merchant on `:8001` — `/ucp/search`, `/ucp/checkout`. Enforces Intent constraints (price band, allowed merchants, expiry). |
+| `services/merchant/catalog.py` | Catalog interface — `mock` (5 hardcoded) or `serpapi` (live Walmart/Target/Wayfair/Etsy). |
+| `services/merchant/serpapi_client.py` | SerpAPI Google Shopping wrapper with 1-hour cache. |
+| `services/shared/mandates.py` | Pydantic models — `IntentMandate`, `MerchantAuthorization`, `LineItem`, `StubSignature`. |
+| `services/shared/intent.py` | `build_intent_from_form()` — validates the form and produces a stub-signed Intent. |
+| `services/shared/stub_sig.py` | `stub_sign(signer, payload)` — placeholder for real device-side signing. |
+| `services/shared/eventlog.py` | Append-only event log that drives the Protocol Inspector. |
+| `agent/mock_agent.py` | Deterministic agent that picks the cheapest matching product. |
+| `agent/sdk_agent.py` | Claude Agent SDK variant — Claude reads descriptions and selects the best semantic match. |
+| `ui/app.py` | Streamlit two-pane UI — 5-field intent form (left) + Protocol Inspector (right). |
+| `scripts/run_demo.py` | One command: merchant + Streamlit. |
+| `scripts/smoke_2nd_poc.py` | Unit smoke (intent builder + mock + optional SerpAPI). |
+| `scripts/smoke_e2e.py` | End-to-end smoke (form → cart). |
+| `docs/2nd-poc.md` | Detailed scope, design choices, run instructions. |
+| `services/psp/`, `services/shared/crypto.py`, `scripts/gen_keys.py` | 1st-PoC artifacts. Preserved but not used by the 2nd PoC. |
+
+## Hosted demo (Streamlit Community Cloud)
+
+Once deployed: <https://ucp-poc.streamlit.app> (or whatever URL you pick).
+
+Setup details: [docs/streamlit-cloud-deploy.md](docs/streamlit-cloud-deploy.md)
+
+The hosted demo runs Mock and Anthropic API agent modes. The "Claude Code (local session)" mode only works when you run the app locally (it requires the `claude` CLI on the host).
 
 ## Prerequisites
 
@@ -52,27 +69,44 @@ The whole purchase chain is cryptographically signed and verified end-to-end:
 - [`uv`](https://docs.astral.sh/uv/) (`winget install --id=astral-sh.uv` on Windows)
 - For the Claude Agent SDK variant: Claude Code CLI installed and signed in
   (`npm i -g @anthropic-ai/claude-code`, then `claude` once to log in).
+- Optional, for live merchant data: a free SerpAPI key (250 searches/month) —
+  <https://serpapi.com/users/sign_up>.
 
-## Quickstart
+## Quickstart — mock catalog (no external services needed)
 
 ```powershell
-uv sync                                # install runtime deps
-uv run python scripts/gen_keys.py      # one-time: generate ES256 keypairs
-uv run python scripts/run_demo.py      # start merchant + PSP + Streamlit
+uv sync
+uv run python scripts/run_demo.py
 ```
 
-Open <http://localhost:8501>. Try:
+Open <http://localhost:8501>. Fill in the form (e.g. `running shoes` / $0–200 /
+all merchants / 24 hours / No), click **Submit**, and watch the cart appear
+with a merchant badge. The **Approve & sign** button is intentionally
+disabled.
 
-> *Find me white running shoes under $150 and buy them.*
+## Quickstart — live UCP merchant data (SerpAPI)
 
-For the Claude Agent SDK variant:
+```powershell
+$env:UCP_CATALOG_MODE = "serpapi"
+$env:SERPAPI_KEY = "...your-key..."
+uv run python scripts/run_demo.py
+```
+
+Same form, but the cart now shows a real product image, real price, and the
+real source merchant (Walmart / Target / Wayfair / Etsy).
+
+## Claude Agent SDK variant
 
 ```powershell
 uv sync --group agent
+$env:UCP_CATALOG_MODE = "serpapi"      # or "mock"
+$env:SERPAPI_KEY = "..."
 uv run --group agent python scripts/run_demo.py
 ```
 
-Then choose **Claude Agent SDK** in the *Agent* dropdown before sending a prompt.
+Then choose **Claude Agent SDK** in the *Agent* dropdown. Claude reads the
+product descriptions and picks the one that best matches your intent (e.g.
+"marathon-ready" → prefers a carbon-plate runner over the cheapest match).
 
 ## Demo script (talking points for a 5-minute walkthrough)
 

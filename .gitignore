@@ -5,10 +5,16 @@ __pycache__/
 keys/
 *.pem
 logs/
-.streamlit/
+.streamlit/secrets.toml
 .uv-cache/
 .pytest_cache/
 .idea/
 .vscode/
 *.log
 .claude/settings.local.json
+
+# Spawned worktree directories
+affectionate-*/
+brave-*/
+*-noether-*/
+*-albattani-*/

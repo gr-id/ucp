@@ -1,262 +1,135 @@
-"""Mock shopping agent — runs the full UCP+AP2 flow without an LLM.
+"""Mock shopping agent — 2nd PoC, form-driven.
 
-Drives the demo end-to-end:
-  1. Parse the user prompt (very naive — keyword extraction).
-  2. Sign an Intent Mandate.
-  3. UCP search → pick the cheapest match within constraints.
-  4. UCP checkout → receive merchant_authorization.
-  5. Pause for user approval (caller decides).
-  6. Sign Checkout Mandate → complete checkout.
-  7. Sign Payment Mandate → PSP charge.
+Runs the structured-intent flow without an LLM:
+  1. Build & stub-sign an IntentMandate from the form dict.
+  2. UCP search across the form's allowed merchants and price band.
+  3. Pick the cheapest matching product (no semantic reasoning).
+  4. UCP checkout — receive the merchant's StubSignature.
+  5. STOP. The 2nd PoC never proceeds to Approve / Payment.
 
-The agent never directly handles money — only signs verifiable credentials
-and orchestrates calls between the UCP merchant and the PSP.
+The PSP service is never contacted; the `finalize()` API of the 1st PoC is gone.
 """
 
 from __future__ import annotations
 
-import re
-import time
 from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
 
-from services.shared.crypto import sign
 from services.shared.eventlog import log_event
-from services.shared.mandates import (
-    CheckoutMandate,
-    Constraints,
-    IntentMandate,
-    PaymentMandate,
-)
+from services.shared.intent import build_intent_from_form
+from services.shared.mandates import IntentMandate, MerchantAuthorization
 
 MERCHANT_URL = "http://localhost:8001"
-PSP_URL = "http://localhost:8002"
-
-
-# ---------- naive prompt parsing ----------
-
-
-def parse_prompt(prompt: str) -> tuple[str, Constraints]:
-    """Extract a UCP search query and constraints from a free-text prompt.
-
-    The real demo uses Claude — this is just enough to make the mock useful.
-    """
-    text = prompt.lower()
-
-    # Price ceiling — "$150", "under 150", "150달러 이하" etc.
-    max_price_cents: int | None = None
-    m = re.search(r"\$?\s*(\d{2,5})\s*(달러|usd|dollars?)?\s*(이하|미만|under|below)?", text)
-    if m:
-        # Be conservative: only treat as a ceiling if we see "under/이하/미만" or a $ prefix.
-        if "$" in prompt or any(w in text for w in ("under", "below", "이하", "미만", "보다 싼")):
-            max_price_cents = int(m.group(1)) * 100
-
-    color: str | None = None
-    for c, kw in [
-        ("white", ("white", "흰", "흰색")),
-        ("black", ("black", "검", "검정", "블랙")),
-    ]:
-        if any(k in text for k in kw):
-            color = c
-            break
-
-    keywords: list[str] = []
-    for kw in ("running", "trail", "tee", "shoe", "shoes", "runner", "runners", "운동화", "신발", "티", "셔츠"):
-        if kw in text:
-            keywords.append(kw)
-
-    # Build a search query that catalog.search can match against.
-    if any(k in text for k in ("running", "runner", "runners", "운동화")):
-        search_q = "running"
-    elif "trail" in text:
-        search_q = "trail"
-    elif any(k in text for k in ("tee", "티", "셔츠")):
-        search_q = "tech tee"
-    else:
-        search_q = ""
-
-    constraints = Constraints(
-        max_price_cents=max_price_cents,
-        currency="USD",
-        keywords=keywords,
-    )
-    return search_q, constraints
-
-
-# ---------- agent state ----------
 
 
 @dataclass
 class AgentSession:
-    user_prompt: str
-    buyer_email: str = "demo@example.com"
+    form: dict[str, Any]
     intent: IntentMandate | None = None
-    intent_jws: str | None = None
-    search_query: str = ""
     candidates: list[dict] = field(default_factory=list)
+    by_merchant: dict[str, int] = field(default_factory=dict)
     selected: dict | None = None
     checkout_body: dict | None = None
-    merchant_authorization_jws: str | None = None
-    checkout_id: str | None = None
-    checkout_mandate_jws: str | None = None
-    psp_result: dict | None = None
+    merchant_authorization: dict | None = None
+    catalog_mode: str | None = None
+    error: str | None = None
+    # Per-user secrets, never logged. Held only for the duration of the call.
+    serpapi_key: str | None = None
 
 
-# ---------- agent steps ----------
-
-
-def step_create_intent(session: AgentSession) -> None:
-    q, constraints = parse_prompt(session.user_prompt)
-    session.search_query = q
-    session.intent = IntentMandate(
-        natural_language=session.user_prompt,
-        constraints=constraints,
-        expires_at=int(time.time()) + 600,
-    )
-    session.intent_jws = sign("user", session.intent.model_dump())
+def _step_build_intent(session: AgentSession) -> None:
+    session.intent = build_intent_from_form(session.form)
     log_event(
         "user",
-        "intent.signed",
-        f"User signed Intent Mandate (q={q!r}, max=${(constraints.max_price_cents or 0)/100:.0f})",
-        {"intent_mandate_jws": session.intent_jws, "intent": session.intent.model_dump()},
+        "intent.built",
+        f"Intent {session.intent.jti} signed "
+        f"(${session.intent.price_range.from_cents/100:.0f}–${session.intent.price_range.to_cents/100:.0f}, "
+        f"{session.intent.allowed_merchants}, exp {session.intent.expires_at})",
+        {"intent_mandate": session.intent.model_dump()},
     )
 
 
-def step_search_and_select(session: AgentSession) -> None:
+def _step_search(session: AgentSession) -> None:
     assert session.intent is not None
-    with httpx.Client(timeout=10) as client:
-        r = client.post(
-            f"{MERCHANT_URL}/ucp/search",
-            json={
-                "query": session.search_query,
-                "max_price_cents": session.intent.constraints.max_price_cents,
-                "color": _color_from_keywords(session.intent.natural_language),
-            },
-        )
+    body = {
+        "item_query": session.intent.item_query,
+        "price_from_cents": session.intent.price_range.from_cents,
+        "price_to_cents": session.intent.price_range.to_cents,
+        "allowed_merchants": session.intent.allowed_merchants,
+    }
+    if session.serpapi_key:
+        body["serpapi_key"] = session.serpapi_key
+    with httpx.Client(timeout=30) as client:
+        r = client.post(f"{MERCHANT_URL}/ucp/search", json=body)
         r.raise_for_status()
         data = r.json()
-    session.candidates = data["results"]
+    session.candidates = data.get("results", [])
+    session.by_merchant = data.get("by_merchant", {})
+    session.catalog_mode = data.get("catalog_mode")
+
+
+def _step_select(session: AgentSession) -> None:
     if not session.candidates:
-        log_event("agent", "search.empty", "No matching products")
         return
     session.selected = min(session.candidates, key=lambda p: p["price_cents"])
     log_event(
         "agent",
         "agent.select",
-        f"Agent selected {session.selected['title']} (${session.selected['price_cents']/100:.2f})",
-        {"candidates": session.candidates, "selected": session.selected},
+        f"Selected {session.selected['title']} from {session.selected.get('source_merchant')} "
+        f"(${session.selected['price_cents']/100:.2f})",
+        {"selected": session.selected, "candidates_count": len(session.candidates)},
     )
 
 
-def _color_from_keywords(prompt: str) -> str | None:
-    text = prompt.lower()
-    if any(k in text for k in ("white", "흰", "흰색")):
-        return "white"
-    if any(k in text for k in ("black", "검", "검정", "블랙")):
-        return "black"
-    return None
-
-
-def step_create_checkout(session: AgentSession) -> None:
-    assert session.selected is not None and session.intent_jws is not None
-    with httpx.Client(timeout=10) as client:
+def _step_checkout(session: AgentSession) -> None:
+    assert session.intent is not None and session.selected is not None
+    with httpx.Client(timeout=15) as client:
         r = client.post(
             f"{MERCHANT_URL}/ucp/checkout",
             json={
                 "items": [{"product_id": session.selected["id"], "qty": 1}],
-                "buyer_email": session.buyer_email,
-                "intent_mandate_jws": session.intent_jws,
+                "buyer_email": session.form.get("buyer_email", "demo@example.com"),
+                "intent_mandate": session.intent.model_dump(),
             },
         )
-        r.raise_for_status()
+        if r.status_code != 200:
+            session.error = f"merchant rejected: {r.status_code} {r.text}"
+            log_event("merchant", "ucp.checkout.reject", session.error)
+            return
         data = r.json()
     session.checkout_body = data["checkout"]
-    session.merchant_authorization_jws = data["ap2"]["merchant_authorization"]
-    session.checkout_id = session.checkout_body["id"]
+    session.merchant_authorization = data["merchant_authorization"]
     log_event(
         "agent",
         "agent.cart_ready",
-        f"Cart ready for user review: {session.checkout_body['id']} (${session.checkout_body['total_cents']/100:.2f})",
+        f"Cart ready: {session.checkout_body['id']} (${session.checkout_body['total_cents']/100:.2f}) "
+        f"— PoC stops here (no Approve).",
         {"checkout": session.checkout_body},
     )
 
 
-def step_user_approve_and_complete(session: AgentSession) -> None:
-    """User has approved the cart in the UI — sign Checkout Mandate and complete."""
-    assert (
-        session.intent_jws is not None
-        and session.checkout_body is not None
-        and session.merchant_authorization_jws is not None
-        and session.checkout_id is not None
-    )
-    cm = CheckoutMandate(
-        intent_mandate_jws=session.intent_jws,
-        checkout_body=session.checkout_body,
-        merchant_authorization_jws=session.merchant_authorization_jws,
-        user_decision="approved",
-    )
-    cm_jws = sign("user", cm.model_dump())
-    session.checkout_mandate_jws = cm_jws
+def run_until_cart_form(form: dict[str, Any], serpapi_key: str | None = None) -> AgentSession:
+    """Drive the entire 2nd-PoC flow up to (but not including) Approve.
+
+    `serpapi_key` is the per-user SerpAPI key; if None the server falls back
+    to its SERPAPI_KEY env var.
+    """
+    session = AgentSession(form=form, serpapi_key=serpapi_key)
     log_event(
         "user",
-        "checkout_mandate.signed",
-        "User signed Checkout Mandate (approves cart + binds merchant_authorization)",
-        {"checkout_mandate_jws": cm_jws, "checkout_mandate": cm.model_dump()},
+        "form.submit",
+        f"User submitted form: {form.get('item_query')!r} in {form.get('allowed_merchants')}",
+        {"form": form, "user_supplied_serpapi_key": bool(serpapi_key)},
     )
-
-    with httpx.Client(timeout=10) as client:
-        r = client.post(
-            f"{MERCHANT_URL}/ucp/checkout/{session.checkout_id}/complete",
-            json={"checkout_mandate_jws": cm_jws},
-        )
-        r.raise_for_status()
-        complete = r.json()
-
-    # Sign Payment Mandate and send to PSP.
-    pm = PaymentMandate(
-        checkout_mandate_jws=cm_jws,
-        amount_cents=complete["payment_mandate_jws_request"]["amount_cents"],
-        currency=complete["payment_mandate_jws_request"]["currency"],
-        merchant_id=complete["payment_mandate_jws_request"]["merchant_id"],
-    )
-    pm_jws = sign("user", pm.model_dump())
-    log_event(
-        "user",
-        "payment_mandate.signed",
-        f"User signed Payment Mandate for ${pm.amount_cents/100:.2f}",
-        {"payment_mandate_jws": pm_jws, "payment_mandate": pm.model_dump()},
-    )
-
-    with httpx.Client(timeout=10) as client:
-        r = client.post(
-            f"{PSP_URL}/psp/charge",
-            json={"payment_mandate_jws": pm_jws},
-        )
-        r.raise_for_status()
-        session.psp_result = r.json()
-
-    log_event(
-        "agent",
-        "agent.done",
-        f"Purchase complete: {session.psp_result['transaction_id']}",
-        {"psp_result": session.psp_result},
-    )
-
-
-def run_until_cart(prompt: str) -> AgentSession:
-    """Stage 1: create intent + search + propose cart. Stops for user approval."""
-    session = AgentSession(user_prompt=prompt)
-    log_event("user", "user.prompt", f"User: {prompt}")
-    step_create_intent(session)
-    step_search_and_select(session)
-    if session.selected is not None:
-        step_create_checkout(session)
-    return session
-
-
-def finalize(session: AgentSession) -> AgentSession:
-    """Stage 2: called after the user clicks 'Approve' in the UI."""
-    step_user_approve_and_complete(session)
+    try:
+        _step_build_intent(session)
+        _step_search(session)
+        _step_select(session)
+        if session.selected is not None:
+            _step_checkout(session)
+    except Exception as e:
+        session.error = str(e)
+        log_event("agent", "agent.error", session.error)
     return session
