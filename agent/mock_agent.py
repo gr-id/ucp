@@ -35,6 +35,10 @@ class AgentSession:
     merchant_authorization: dict | None = None
     catalog_mode: str | None = None
     error: str | None = None
+    # 3rd-PoC: comparison report + signed decision trace. Mock agent leaves
+    # these None to keep the cheap-vs-rich-rationale contrast visible in UI.
+    comparison: dict | None = None
+    decision_trace: dict | None = None
     # Per-user secrets, never logged. Held only for the duration of the call.
     serpapi_key: str | None = None
 
