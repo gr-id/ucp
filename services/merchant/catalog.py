@@ -19,6 +19,12 @@ from services.shared.mandates import LineItem
 
 # Tagged with source_merchant so the 2nd-PoC UI behaves the same way in mock
 # mode (badges, merchant filter respected).
+#
+# 3rd PoC: `rating` and `reviews_count` are now populated on every mock SKU
+# so the comparison engine has real data on every dimension. Prices and
+# ratings are tuned so different priority presets produce different winners
+# (cheapest → walmart $99, balanced/trusted → target with 4.8 rating,
+# fastest → walmart). SerpAPI provides these fields natively.
 _MOCK_PRODUCTS: list[dict] = [
     {
         "id": "sku_runner_w_01",
@@ -26,12 +32,14 @@ _MOCK_PRODUCTS: list[dict] = [
         "brand": "Aerolift",
         "color": "white",
         "category": "running-shoes",
-        "price_cents": 12900,
+        "price_cents": 9900,
         "currency": "USD",
         "description": "Lightweight white running shoes with breathable mesh upper.",
         "image_url": None,
         "source_merchant": "walmart",
         "product_url": "https://walmart.com/example/sku_runner_w_01",
+        "rating": 3.7,
+        "reviews_count": 412,
     },
     {
         "id": "sku_runner_w_02",
@@ -39,12 +47,14 @@ _MOCK_PRODUCTS: list[dict] = [
         "brand": "Strideworks",
         "color": "white",
         "category": "running-shoes",
-        "price_cents": 14500,
+        "price_cents": 11900,
         "currency": "USD",
         "description": "Marathon-ready white runners, carbon plate, 7mm drop.",
         "image_url": None,
         "source_merchant": "target",
         "product_url": "https://target.com/example/sku_runner_w_02",
+        "rating": 4.7,
+        "reviews_count": 2034,
     },
     {
         "id": "sku_runner_k_01",
@@ -52,12 +62,14 @@ _MOCK_PRODUCTS: list[dict] = [
         "brand": "Aerolift",
         "color": "black",
         "category": "running-shoes",
-        "price_cents": 13900,
+        "price_cents": 10900,
         "currency": "USD",
         "description": "Black daily trainer, knit upper, foam midsole.",
         "image_url": None,
         "source_merchant": "walmart",
         "product_url": "https://walmart.com/example/sku_runner_k_01",
+        "rating": 4.0,
+        "reviews_count": 781,
     },
     {
         "id": "sku_runner_w_03",
@@ -65,12 +77,29 @@ _MOCK_PRODUCTS: list[dict] = [
         "brand": "Northhaul",
         "color": "white",
         "category": "trail-shoes",
-        "price_cents": 17500,
+        "price_cents": 13500,
         "currency": "USD",
         "description": "White trail runner, aggressive lugs, GORE-TEX.",
         "image_url": None,
         "source_merchant": "wayfair",
         "product_url": "https://wayfair.com/example/sku_runner_w_03",
+        "rating": 4.4,
+        "reviews_count": 156,
+    },
+    {
+        "id": "sku_runner_e_01",
+        "title": "Handmade Cloudrunner White",
+        "brand": "Boutique Lab",
+        "color": "white",
+        "category": "running-shoes",
+        "price_cents": 14500,
+        "currency": "USD",
+        "description": "Handcrafted running shoe, limited batches, white knit upper.",
+        "image_url": None,
+        "source_merchant": "etsy",
+        "product_url": "https://etsy.com/example/sku_runner_e_01",
+        "rating": 4.9,
+        "reviews_count": 47,
     },
     {
         "id": "sku_tee_w_01",
@@ -84,6 +113,8 @@ _MOCK_PRODUCTS: list[dict] = [
         "image_url": None,
         "source_merchant": "etsy",
         "product_url": "https://etsy.com/example/sku_tee_w_01",
+        "rating": 4.3,
+        "reviews_count": 88,
     },
 ]
 
@@ -135,11 +166,37 @@ def search(
 
     `serpapi_key` is only consulted in serpapi mode; if None, the server's
     SERPAPI_KEY env var is used.
+
+    3rd PoC: each returned product is augmented with `reputation_score` and
+    `shipping_note` from the static_demo_registry so the agent sees the same
+    enrichment in both modes. The raw SerpAPI/mock fields are preserved.
     """
     merchants_t = tuple(sorted(set(allowed_merchants))) if allowed_merchants else ()
     if get_mode() == "serpapi":
-        return _serpapi_search(query, from_cents, to_cents, merchants_t, serpapi_key)
-    return _mock_search(query, from_cents, to_cents, merchants_t)
+        products = _serpapi_search(query, from_cents, to_cents, merchants_t, serpapi_key)
+    else:
+        products = _mock_search(query, from_cents, to_cents, merchants_t)
+    return [_enrich(p) for p in products]
+
+
+def _enrich(product: dict) -> dict:
+    """Attach static_demo_registry fields without mutating the original dict.
+
+    Kept side-effect-free so SerpAPI's in-memory cache (which stores the
+    pre-enrichment dicts) isn't polluted across calls.
+    """
+    # Import locally to avoid a circular import between catalog and
+    # comparison (which depends on reputation but is consumed by the agent
+    # layer, not the merchant layer).
+    from services.shared import reputation
+
+    merchant = (product.get("source_merchant") or "").lower()
+    enriched = dict(product)
+    enriched["reputation_score"] = reputation.reputation_score(merchant)
+    enriched["reputation_source"] = reputation.SOURCE_TAG
+    enriched["shipping_note"] = reputation.shipping_note(merchant)
+    enriched["shipping_days_eta"] = reputation.shipping_days(merchant)
+    return enriched
 
 
 def get(product_id: str) -> dict | None:

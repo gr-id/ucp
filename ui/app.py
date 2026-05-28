@@ -91,9 +91,10 @@ _start_merchant_subprocess()
 
 from agent.mock_agent import AgentSession, run_until_cart_form  # noqa: E402
 from services.shared.eventlog import read_all, reset  # noqa: E402
-from services.shared.intent import SUPPORTED_MERCHANTS  # noqa: E402
+from services.shared.intent import SUPPORTED_MERCHANTS, SUPPORTED_PRIORITIES  # noqa: E402
+from services.shared.mandates import PRIORITY_PRESETS  # noqa: E402
 
-st.set_page_config(page_title="UCP + AP2 — 2nd PoC", layout="wide", page_icon="🛒")
+st.set_page_config(page_title="UCP + AP2 — 3rd PoC", layout="wide", page_icon="🛒")
 
 
 def services_up() -> bool:
@@ -128,6 +129,7 @@ def init_state() -> None:
     st.session_state.setdefault("merchants_selected", list(SUPPORTED_MERCHANTS))
     st.session_state.setdefault("user_serpapi_key", "")
     st.session_state.setdefault("user_anthropic_key", "")
+    st.session_state.setdefault("priority_preset", "balanced")
 
 
 def reset_demo() -> None:
@@ -140,9 +142,9 @@ init_state()
 
 
 # ===== HEADER =====
-st.title("🛒 UCP + AP2 — 2nd PoC")
+st.title("🛒 UCP + AP2 — 3rd PoC")
 st.caption(
-    "Structured shopping-intent form → live UCP merchant search → cart preview. "
+    "Structured shopping intent → multi-merchant comparison → signed agent rationale → cart preview. "
     "Payment step is intentionally disabled."
 )
 
@@ -260,6 +262,32 @@ with left:
 
             valid_hours = st.number_input("유지 시간 (시간)", min_value=1, max_value=720, value=24, step=1,
                                           help="Intent Mandate 가 유효한 기간")
+
+            priority_labels = {
+                "cheapest": "💰 cheapest",
+                "balanced": "⚖️ balanced",
+                "trusted":  "🏆 trusted",
+                "fastest":  "⚡ fastest",
+            }
+            current_default = st.session_state.get("priority_preset", "balanced")
+            priority_preset = st.radio(
+                "우선순위",
+                list(SUPPORTED_PRIORITIES),
+                index=list(SUPPORTED_PRIORITIES).index(current_default),
+                format_func=lambda p: priority_labels.get(p, p),
+                horizontal=True,
+                help=(
+                    "에이전트가 후보를 비교할 때 쓸 가중치 프리셋.\n"
+                    "이 선택은 Intent Mandate의 payload_hash 에 포함되어 서명됩니다 — 변경하면 새 mandate."
+                ),
+            )
+            # Caption: show the expanded weights vector under the selected preset.
+            _w = PRIORITY_PRESETS[priority_preset]
+            st.caption(
+                f"가중치: price={_w.price:.2f}  trust={_w.trust:.2f}  "
+                f"rating={_w.rating:.2f}  shipping={_w.shipping:.2f}"
+            )
+
             auto_purchase = st.radio(
                 "자동 구매 허용",
                 ["No", "Yes"],
@@ -271,6 +299,7 @@ with left:
 
         if submitted:
             st.session_state.merchants_selected = selected
+            st.session_state.priority_preset = priority_preset
             reset()
             form_data = {
                 "item_query": item_query,
@@ -279,6 +308,7 @@ with left:
                 "allowed_merchants": selected,
                 "valid_hours": int(valid_hours),
                 "auto_purchase": (auto_purchase == "Yes"),
+                "priority_preset": priority_preset,
                 "buyer_email": "demo@example.com",
             }
             serpapi_key = st.session_state.user_serpapi_key.strip() or None
@@ -321,15 +351,104 @@ with left:
             if session.intent is not None:
                 intent_box = st.container(border=True)
                 with intent_box:
+                    preset_label = session.intent.priority_preset or "—"
                     st.markdown(
                         f"**물품:** {session.intent.item_query}  \n"
                         f"**가격대:** {cents(session.intent.price_range.from_cents)} – "
                         f"{cents(session.intent.price_range.to_cents)}  \n"
                         f"**머천트:** {', '.join(session.intent.allowed_merchants)}  \n"
-                        f"**자동 구매:** {'Yes' if session.intent.auto_purchase else 'No'}"
+                        f"**우선순위:** `{preset_label}`  \n"
+                        f"**자동 구매:** {'Yes' if session.intent.auto_purchase else 'No'}  \n"
+                        f"<small><code>mandate hash: {session.intent.signature.payload_hash}</code></small>",
+                        unsafe_allow_html=True,
                     )
 
-            st.markdown("##### 2. 카트")
+            # 3rd-PoC: comparison + signed agent decision trace (SDK mode only).
+            if session.comparison:
+                st.markdown("##### 2. Agent 비교 결과")
+                comp = session.comparison
+                rows = []
+                for c in comp["candidates"]:
+                    is_engine = c["product_id"] == comp["engine_winner_id"]
+                    is_agent = (
+                        session.decision_trace
+                        and c["product_id"] == session.decision_trace.get("agent_winner_id")
+                    )
+                    pick = ""
+                    if is_engine and is_agent:
+                        pick = "✅ engine + agent"
+                    elif is_engine:
+                        pick = "📊 engine top"
+                    elif is_agent:
+                        pick = "🤖 agent override"
+                    rows.append({
+                        "pick": pick,
+                        "merchant": c["source_merchant"],
+                        "title": c["title"][:38],
+                        "price": f"${c['price_cents']/100:.2f}",
+                        "rating": (f"{c['rating']:.1f}" if c.get("rating") is not None else "—"),
+                        "reviews": c.get("reviews_count") or "—",
+                        "reputation": c["reputation_score"],
+                        "shipping": c["shipping_note"][:24],
+                        "score": round(c["weighted_score"], 3),
+                    })
+                st.dataframe(rows, hide_index=True, use_container_width=True)
+                st.caption(
+                    f"dimensions: {' · '.join(comp['dimensions_used'])} "
+                    "(reputation/shipping는 demo 정적 레지스트리)"
+                )
+
+                if session.decision_trace:
+                    dt = session.decision_trace
+                    override = dt["agent_winner_id"] != dt["engine_winner_id"]
+                    badge = "🤖 OVERRIDE" if override else "✅ CONCUR"
+                    trace_box = st.container(border=True)
+                    with trace_box:
+                        st.markdown(f"**{badge}** — {dt['headline']}")
+                        st.markdown(
+                            f"<small>우선순위 적용: {dt['priority_explanation']}</small>",
+                            unsafe_allow_html=True,
+                        )
+                        if dt.get("dropped_dimensions"):
+                            st.markdown(
+                                f"<small>⚠️ 데이터 부족으로 무시된 차원: "
+                                f"{', '.join(dt['dropped_dimensions'])}</small>",
+                                unsafe_allow_html=True,
+                            )
+                        st.markdown(
+                            f"<small><code>decision_trace signer={dt['signature']['signer']} "
+                            f"hash={dt['signature']['payload_hash']}</code></small>",
+                            unsafe_allow_html=True,
+                        )
+                        with st.expander("후보별 trade-off"):
+                            for row in dt["tradeoffs"]:
+                                head = f"`{row['product_id']}`"
+                                if row.get("why_not_chosen") is None:
+                                    head += " — **선택됨**"
+                                else:
+                                    head += f" — {row['why_not_chosen']}"
+                                st.markdown(head)
+                                if row.get("relative_strengths"):
+                                    st.markdown(
+                                        f"  &nbsp;&nbsp;➕ {', '.join(row['relative_strengths'])}",
+                                        unsafe_allow_html=True,
+                                    )
+                                if row.get("relative_weaknesses"):
+                                    st.markdown(
+                                        f"  &nbsp;&nbsp;➖ {', '.join(row['relative_weaknesses'])}",
+                                        unsafe_allow_html=True,
+                                    )
+            else:
+                # Mock agent does not produce a comparison report. Surface the
+                # contrast explicitly so the demo shows what SDK adds.
+                if session.intent is not None and session.selected is not None:
+                    st.info(
+                        "ℹ️ Mock 에이전트는 단순히 최저가 후보를 고릅니다. "
+                        "SDK 에이전트(Claude Code / Anthropic API)는 동일 검색 결과를 "
+                        "Comparison Engine 으로 점수화하고, 서명된 의사결정 근거를 남깁니다."
+                    )
+
+            st.markdown("##### 3. 카트")
             if session.error:
                 st.error(session.error)
             elif session.selected is None:

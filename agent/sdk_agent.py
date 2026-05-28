@@ -26,6 +26,7 @@ from claude_agent_sdk import (
 )
 
 from agent.mock_agent import AgentSession, MERCHANT_URL
+from services.shared.comparison import build_comparison, build_decision_trace
 from services.shared.eventlog import log_event
 from services.shared.intent import build_intent_from_form
 
@@ -75,10 +76,68 @@ async def search_products(args: dict[str, Any]) -> dict[str, Any]:
 
 
 @tool(
+    "compare_candidates",
+    "Run the deterministic Comparison Engine on the current search results. Returns a "
+    "structured table of candidates with weighted scores under the user's priority. Call "
+    "this BEFORE propose_cart so the engine's pre-LLM scoring is on the record and the "
+    "agent's choice can be compared with the engine's. The engine output is then shown "
+    "to the user as the 'why this option' rationale.",
+    {"top_n": int},
+)
+async def compare_candidates(args: dict[str, Any]) -> dict[str, Any]:
+    session = _CURRENT["session"]
+    if session.intent is None:
+        return {"content": [{"type": "text", "text": "Error: no signed intent."}]}
+    if not session.candidates:
+        return {
+            "content": [
+                {"type": "text", "text": "Error: no candidates. Call search_products first."}
+            ]
+        }
+    top_n = max(2, int(args.get("top_n") or 5))
+    report = build_comparison(session.intent, session.candidates, top_n=top_n)
+    if report is None:
+        return {"content": [{"type": "text", "text": "Comparison engine returned no report (empty candidates)."}]}
+    session.comparison = report.model_dump()
+    log_event(
+        "agent",
+        "agent.compare",
+        f"Comparison engine: {len(report.candidates)} candidates, "
+        f"engine_winner={report.engine_winner_id} (preset={session.intent.priority_preset or 'cheapest'})",
+        {"comparison": session.comparison},
+    )
+    # Compact textual representation so the LLM can read and reason over it
+    # without having to parse the full JSON.
+    rows = []
+    for c in report.candidates:
+        flag = " <-- engine_top" if c.product_id == report.engine_winner_id else ""
+        rating_str = f"{c.rating:.1f}" if c.rating is not None else "—"
+        rows.append(
+            f"  {c.product_id}  {c.title[:32]:<32}  {c.source_merchant:>8}  "
+            f"${c.price_cents/100:6.2f}  rating={rating_str:>4}  rep={c.reputation_score}  "
+            f"score={c.weighted_score:.3f}{flag}"
+        )
+    return {
+        "content": [
+            {
+                "type": "text",
+                "text": (
+                    f"Comparison ({len(report.candidates)} candidates, "
+                    f"dims={report.dimensions_used}):\n" + "\n".join(rows) +
+                    f"\nEngine winner: {report.engine_winner_id}"
+                ),
+            }
+        ]
+    }
+
+
+@tool(
     "propose_cart",
     "Open a UCP checkout for the chosen product. Call this once you have decided which "
-    "product best matches the user's intent. The PoC stops after this step (no Approve).",
-    {"product_id": str, "qty": int},
+    "product best matches the user's intent. The PoC stops after this step (no Approve). "
+    "Also accepts a brief `headline` (one sentence) explaining the choice — this becomes "
+    "the agent's signed decision trace.",
+    {"product_id": str, "qty": int, "headline": str},
 )
 async def propose_cart(args: dict[str, Any]) -> dict[str, Any]:
     session = _CURRENT["session"]
@@ -114,6 +173,34 @@ async def propose_cart(args: dict[str, Any]) -> dict[str, Any]:
         f"Cart ready: {session.checkout_body['id']} (${session.checkout_body['total_cents']/100:.2f})",
         {"checkout": session.checkout_body},
     )
+
+    # 3rd PoC: if a comparison was run, build & sign the agent's decision
+    # trace so audit logs show the agent committed to this choice with
+    # a stated rationale. Engine vs agent divergence surfaces here.
+    if session.comparison is not None:
+        from services.shared.mandates import ComparisonReport
+        report = ComparisonReport.model_validate(session.comparison)
+        headline = (args.get("headline") or "").strip() or None
+        try:
+            trace = build_decision_trace(
+                intent=session.intent,
+                report=report,
+                agent_winner_id=args["product_id"],
+                headline=headline,
+            )
+            session.decision_trace = trace.model_dump()
+            override = trace.agent_winner_id != trace.engine_winner_id
+            log_event(
+                "agent",
+                "agent.rationale",
+                ("Override: " if override else "Concur: ") + trace.headline,
+                {"decision_trace": session.decision_trace},
+            )
+        except ValueError as e:
+            # Agent picked something outside the comparison set; log but do
+            # not block the cart (the merchant has already authorized it).
+            log_event("agent", "agent.rationale_skipped", str(e))
+
     return {
         "content": [
             {
@@ -131,18 +218,27 @@ async def propose_cart(args: dict[str, Any]) -> dict[str, Any]:
 SYSTEM_PROMPT = """\
 You are an autonomous shopping agent operating under the AP2 Intent Mandate model.
 
-The user's intent is already signed and known to you (item, price range, allowed merchants).
-You must:
-  1. Call search_products at least once. If results are empty, retry with a broader refine_query
-     (drop adjectives, keep the noun) up to 2 more times.
-  2. Pick ONE product whose description and merchant best match the user's intent. Prefer
-     semantic alignment over the cheapest option.
-  3. Call propose_cart with the chosen product_id and qty=1.
-  4. After propose_cart returns, STOP. Do NOT attempt to approve or finalize — the PoC
-     stops at cart review.
+The user's intent is already signed and known to you (item, price range, allowed merchants,
+and a priority weighting like 'cheapest' / 'balanced' / 'trusted' / 'fastest').
 
-Never invent products. Never call propose_cart with a product not in the last search results.
-If search returns zero matches even after broadening, say so and stop.
+You must follow this exact sequence:
+  1. Call search_products at least once. If results are empty, retry with a broader
+     refine_query (drop adjectives, keep the noun) up to 2 more times.
+  2. Call compare_candidates(top_n=5). It runs a deterministic Comparison Engine and
+     returns a table with price, rating, merchant reputation, and shipping for each
+     candidate, plus a per-candidate weighted_score under the user's priority.
+  3. Read the comparison table and pick ONE product. You may agree with the engine's
+     top pick or override it — but you must base your decision on the fields shown.
+     Do NOT invent numeric fields (rating, reputation, price). If a field is missing
+     for a candidate, say so in your rationale rather than guessing.
+  4. Call propose_cart(product_id=..., qty=1, headline=...). The `headline` is a
+     single sentence (<=120 chars) summarizing why you chose this candidate; it will
+     be persisted as the agent's signed decision trace and shown to the user.
+  5. After propose_cart returns, STOP. Do NOT approve or finalize — the PoC stops at
+     cart review.
+
+Never invent products. Never call propose_cart with a product_id not in the comparison
+report. If search returns zero matches even after broadening, say so and stop.
 """
 
 
@@ -161,20 +257,25 @@ async def _run(session: AgentSession) -> None:
 
     server = create_sdk_mcp_server(
         name="ucp_ap2",
-        version="0.2.0",
-        tools=[search_products, propose_cart],
+        version="0.3.0",
+        tools=[search_products, compare_candidates, propose_cart],
+    )
+    intent_summary = (
+        f"item_query={session.intent.item_query!r}, "
+        f"price ${session.intent.price_range.from_cents/100:.0f}-"
+        f"${session.intent.price_range.to_cents/100:.0f}, "
+        f"merchants={session.intent.allowed_merchants}, "
+        f"priority_preset={session.intent.priority_preset or 'cheapest (default)'}"
     )
     options = ClaudeAgentOptions(
-        system_prompt=SYSTEM_PROMPT
-        + f"\n\nThe user's intent: item_query={session.intent.item_query!r}, "
-        + f"price ${session.intent.price_range.from_cents/100:.0f}–${session.intent.price_range.to_cents/100:.0f}, "
-        + f"merchants={session.intent.allowed_merchants}.",
+        system_prompt=SYSTEM_PROMPT + f"\n\nThe user's intent: {intent_summary}.",
         mcp_servers={"ucp_ap2": server},
         allowed_tools=[
             "mcp__ucp_ap2__search_products",
+            "mcp__ucp_ap2__compare_candidates",
             "mcp__ucp_ap2__propose_cart",
         ],
-        max_turns=8,
+        max_turns=10,
     )
 
     try:
